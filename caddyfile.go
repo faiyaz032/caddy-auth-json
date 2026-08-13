@@ -51,6 +51,33 @@ func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			if !d.AllArgs(&p.Endpoint) {
 				return d.ArgErr()
 			}
+		case "method":
+			if p.Method != "" {
+				return d.Errf("method already declared: %s", p.Method)
+			}
+			if !d.AllArgs(&p.Method) {
+				return d.ArgErr()
+			}
+
+		case "forward_headers":
+			args := d.RemainingArgs()
+			if len(args) == 0 {
+				return d.ArgErr()
+			}
+			p.ForwardHeaders = append(p.ForwardHeaders, args...)
+
+		case "timeout":
+			if p.Timeout != 0 {
+				return d.Errf("timeout already declared")
+			}
+			if !d.NextArg() {
+				return d.ArgErr()
+			}
+			dur, err := caddy.ParseDuration(d.Val())
+			if err != nil {
+				return d.Errf("bad duration value %s: %v", d.Val(), err)
+			}
+			p.Timeout = caddy.Duration(dur)
 
 		default:
 			return d.Errf("unrecognized auth_json subdirective '%s'", d.Val())
