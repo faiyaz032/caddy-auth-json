@@ -51,9 +51,9 @@ func (p *Provider) recordEndpointShape() {
 
 	p.pathSegments = len(strings.Split(u.EscapedPath(), "/"))
 
-	// A host given outright is the only host the authentication request may
-	// ever reach. A host which is itself a placeholder cannot be pinned, and
-	// is left to the operator's judgement.
+	// The host is pinned to whatever was configured, so that no expansion can
+	// send the authentication request elsewhere. A host containing a
+	// placeholder cannot be pinned, and is refused by validateEndpoint.
 	if u.Host != "" && !strings.Contains(u.Host, "{") {
 		p.fixedScheme, p.fixedHost = u.Scheme, u.Host
 	}
@@ -70,6 +70,35 @@ func (p Provider) validateEndpoint() error {
 	// introduced one, which only holds if the configured endpoint has none.
 	if slices.Contains(strings.Split(p.Endpoint, "/"), "..") {
 		return fmt.Errorf("endpoint must not contain a '..' path segment")
+	}
+
+	// A placeholder in the host is refused rather than warned about. Its value
+	// would usually come from the request, which would let a client name the
+	// server that decides whether the request is authorized: point it at one
+	// they control, have it answer 2xx, and every claim is theirs to choose.
+	// Placeholders elsewhere in the URL are fine, since the host stays pinned.
+	//
+	// This reads the raw string rather than a parsed URL because url.Parse
+	// refuses a '{' in the host, and would report it as a generic syntax
+	// error which says nothing about why it matters here. Without this,
+	// such an endpoint also leaves recordEndpointShape unable to parse
+	// anything, so every check in resolveEndpoint would be skipped.
+	if _, rest, ok := strings.Cut(p.Endpoint, "://"); ok {
+		if authority, _, _ := strings.Cut(rest, "/"); strings.Contains(authority, "{") {
+			return fmt.Errorf("endpoint host must not contain a placeholder, got %q; "+
+				"the authentication service has to be a fixed host", authority)
+		}
+	}
+
+	u, err := url.Parse(p.Endpoint)
+	if err != nil {
+		return fmt.Errorf("endpoint %q is not a valid URL: %w", p.Endpoint, err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("endpoint %q has no host", p.Endpoint)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("endpoint %q must use http or https", p.Endpoint)
 	}
 
 	return nil
@@ -100,20 +129,28 @@ func (p Provider) resolveEndpoint(repl *caddy.Replacer) (string, error) {
 			u.Scheme, u.Host, p.fixedScheme, p.fixedHost)
 	}
 
-	segments := strings.Split(u.EscapedPath(), "/")
+	// Both forms of the path are checked. EscapedPath is what goes on the
+	// wire, but it leaves %2F encoded, so a traversal hidden as "..%2F..%2F"
+	// reads as one harmless segment there. Path is the decoded form, which is
+	// what a server that decodes before routing will act on, and it is where
+	// that payload becomes visible as real separators. Checking only one of
+	// them leaves a way past.
+	for _, path := range []string{u.EscapedPath(), u.Path} {
+		segments := strings.Split(path, "/")
 
-	if slices.Contains(segments, "..") {
-		return "", fmt.Errorf("endpoint %q traverses out of its path after placeholder expansion", raw)
-	}
+		if slices.Contains(segments, "..") {
+			return "", fmt.Errorf("endpoint %q traverses out of its path after placeholder expansion", raw)
+		}
 
-	// A placeholder stands for one path segment. A value carrying '/', '?' or
-	// '#' would otherwise restructure the URL around it and address a
-	// different endpoint without any traversal being involved: a tenant of
-	// "http://elsewhere/health?" turns /tenants/{tenant}/permissions into
-	// /tenants/http:/elsewhere/health.
-	if p.pathSegments != 0 && len(segments) != p.pathSegments {
-		return "", fmt.Errorf("endpoint %q has %d path segments after placeholder expansion, but was configured with %d",
-			raw, len(segments), p.pathSegments)
+		// A placeholder stands for one path segment. A value carrying '/', '?'
+		// or '#' would otherwise restructure the URL around it and address a
+		// different endpoint without any traversal being involved: a tenant of
+		// "http://elsewhere/health?" turns /tenants/{tenant}/permissions into
+		// /tenants/http:/elsewhere/health.
+		if p.pathSegments != 0 && len(segments) != p.pathSegments {
+			return "", fmt.Errorf("endpoint %q has %d path segments after placeholder expansion, but was configured with %d",
+				raw, len(segments), p.pathSegments)
+		}
 	}
 
 	return u.String(), nil
