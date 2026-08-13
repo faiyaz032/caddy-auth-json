@@ -314,6 +314,30 @@ func TestAuthenticateDoesNotFollowRedirects(t *testing.T) {
 	}
 }
 
+// TestCleanup covers being torn down without ever having been provisioned,
+// which happens when an earlier module in the same config fails to load.
+func TestCleanup(t *testing.T) {
+	t.Run("before provisioning", func(t *testing.T) {
+		p := new(Provider)
+		if err := p.Cleanup(); err != nil {
+			t.Fatalf("Cleanup on an unprovisioned provider: %v", err)
+		}
+	})
+
+	t.Run("after provisioning", func(t *testing.T) {
+		ctx, cancel := caddy.NewContext(caddy.Context{Context: context.Background()})
+		t.Cleanup(cancel)
+
+		p := &Provider{Endpoint: "http://auth.invalid/verify"}
+		if err := p.Provision(ctx); err != nil {
+			t.Fatalf("provisioning: %v", err)
+		}
+		if err := p.Cleanup(); err != nil {
+			t.Fatalf("Cleanup: %v", err)
+		}
+	})
+}
+
 // TestClaimToString documents how decoded JSON values are rendered for
 // User.Metadata, which can carry nothing but strings.
 func TestClaimToString(t *testing.T) {

@@ -131,6 +131,17 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+// Cleanup releases the connections held open for the authentication service.
+// Caddy provisions a fresh instance on every config reload, so without this
+// the previous client's idle connections would linger until the garbage
+// collector got to them.
+func (p *Provider) Cleanup() error {
+	if p.client != nil {
+		p.client.CloseIdleConnections()
+	}
+	return nil
+}
+
 // Validate ensures the provider's configuration is valid. Pointers are
 // checked here rather than at first use, so that a malformed one is
 // reported at startup instead of silently denying every request.
@@ -287,4 +298,5 @@ var (
 	_ caddy.Provisioner       = (*Provider)(nil)
 	_ caddyauth.Authenticator = (*Provider)(nil)
 	_ caddy.Validator         = (*Provider)(nil)
+	_ caddy.CleanerUpper      = (*Provider)(nil)
 )
