@@ -15,6 +15,7 @@
 package authjson
 
 import (
+	"fmt"
 	"net/http"
 
 	"go.uber.org/zap"
@@ -55,6 +56,14 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+// Validate ensures the provider's configuration is valid.
+func (p *Provider) Validate() error {
+	if p.Endpoint == "" {
+		return fmt.Errorf("endpoint is required")
+	}
+	return nil
+}
+
 // Authenticate validates the user credentials in r and returns the user, if valid.
 func (p Provider) Authenticate(w http.ResponseWriter, r *http.Request) (caddyauth.User, bool, error) {
 	return caddyauth.User{ID: "test"}, true, nil
@@ -64,4 +73,5 @@ func (p Provider) Authenticate(w http.ResponseWriter, r *http.Request) (caddyaut
 var (
 	_ caddy.Provisioner       = (*Provider)(nil)
 	_ caddyauth.Authenticator = (*Provider)(nil)
+	_ caddy.Validator         = (*Provider)(nil)
 )
