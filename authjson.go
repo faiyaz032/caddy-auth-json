@@ -15,21 +15,29 @@
 package authjson
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 
 	"github.com/caddyserver/caddy/v2"
+	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp/caddyauth"
 )
 
 func init() {
 	caddy.RegisterModule(Provider{})
 }
+
+const (
+	defaultTimeout = 10 * time.Second
+	defaultMaxSize = 1 << 20 // 1 MB
+)
 
 // Provider facilitates HTTP authentication against a service which
 // responds with a JSON body. Fields of that body are addressed with
@@ -52,6 +60,28 @@ type Provider struct {
 	// How long to wait for the authentication service to respond.
 	// Default: 10s
 	Timeout caddy.Duration `json:"timeout,omitempty"`
+
+	// Fields to extract from the authentication service's response body.
+	// Each key is a variable name, made available as {vars.<name>} and
+	// as {http.auth.user.<name>}; each value is a JSON Pointer into the
+	// response body. A field which the service omits is simply not set.
+	Claims map[string]string `json:"claims,omitempty"`
+
+	// A JSON Pointer to the field which identifies the user, exposed
+	// as {http.auth.user.id}.
+	UserID string `json:"user_id,omitempty"`
+
+	// The maximum amount of the authentication service's response body
+	// to read. A larger response is rejected rather than truncated,
+	// since a partial JSON document cannot be trusted. Default: 1MB
+	MaxSize int64 `json:"max_size,omitempty"`
+
+	// the shape the configured endpoint had before any placeholder was
+	// expanded; recorded in Provision and enforced on every request.
+	// See endpoint.go.
+	fixedScheme  string
+	fixedHost    string
+	pathSegments int
 
 	client *http.Client
 	logger *zap.Logger
@@ -76,8 +106,14 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 	}
 
 	if p.Timeout == 0 {
-		p.Timeout = caddy.Duration(10 * time.Second)
+		p.Timeout = caddy.Duration(defaultTimeout)
 	}
+
+	if p.MaxSize == 0 {
+		p.MaxSize = defaultMaxSize
+	}
+
+	p.recordEndpointShape()
 
 	p.client = &http.Client{
 		Timeout: time.Duration(p.Timeout),
@@ -95,10 +131,26 @@ func (p *Provider) Provision(ctx caddy.Context) error {
 	return nil
 }
 
-// Validate ensures the provider's configuration is valid.
+// Validate ensures the provider's configuration is valid. Pointers are
+// checked here rather than at first use, so that a malformed one is
+// reported at startup instead of silently denying every request.
 func (p *Provider) Validate() error {
-	if p.Endpoint == "" {
-		return fmt.Errorf("endpoint is required")
+	if err := p.validateEndpoint(); err != nil {
+		return err
+	}
+
+	if p.MaxSize < 0 {
+		return fmt.Errorf("max_size must not be negative")
+	}
+	if p.UserID != "" {
+		if err := validateJSONPointer(p.UserID); err != nil {
+			return fmt.Errorf("user_id: %w", err)
+		}
+	}
+	for name, ptr := range p.Claims {
+		if err := validateJSONPointer(ptr); err != nil {
+			return fmt.Errorf("claim %s: %w", name, err)
+		}
 	}
 	return nil
 }
@@ -106,7 +158,11 @@ func (p *Provider) Validate() error {
 // Authenticate validates the user credentials in r and returns the user, if valid.
 func (p Provider) Authenticate(w http.ResponseWriter, r *http.Request) (caddyauth.User, bool, error) {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	endpoint := repl.ReplaceAll(p.Endpoint, "")
+
+	endpoint, err := p.resolveEndpoint(repl)
+	if err != nil {
+		return caddyauth.User{}, false, err
+	}
 
 	// the incoming request's context is used so that a client
 	// disconnect also cancels the authentication request
@@ -127,9 +183,14 @@ func (p Provider) Authenticate(w http.ResponseWriter, r *http.Request) (caddyaut
 	}
 	defer resp.Body.Close()
 
-	// the body is unused for now, but draining it lets the
-	// connection be returned to the pool and reused
-	_, _ = io.Copy(io.Discard, resp.Body)
+	// One byte past the cap is read so that a body sitting exactly on the
+	// limit can be told apart from one which ran over it. Reading here
+	// rather than after the status check also drains the response, which
+	// lets the connection go back to the pool.
+	body, err := io.ReadAll(io.LimitReader(resp.Body, p.MaxSize+1))
+	if err != nil {
+		return caddyauth.User{}, false, fmt.Errorf("reading auth response: %w", err)
+	}
 
 	// A non-2xx response means the service declined the request, which is
 	// reported as an unauthenticated result rather than an error. Both
@@ -147,7 +208,78 @@ func (p Provider) Authenticate(w http.ResponseWriter, r *http.Request) (caddyaut
 		return caddyauth.User{}, false, nil
 	}
 
-	return caddyauth.User{}, true, nil
+	// The body is rejected rather than truncated: a JSON document cut off
+	// partway either fails to parse or, worse, parses as a valid object
+	// which happens to be missing the field that would have denied access.
+	if int64(len(body)) > p.MaxSize {
+		return caddyauth.User{}, false, fmt.Errorf("auth response exceeds max_size of %d bytes", p.MaxSize)
+	}
+
+	// With nothing to extract, a 2xx is the whole verdict, and the
+	// response need not be JSON at all.
+	if len(p.Claims) == 0 && p.UserID == "" {
+		return caddyauth.User{}, true, nil
+	}
+
+	var doc any
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return caddyauth.User{}, false, fmt.Errorf("decoding auth response: %w", err)
+	}
+
+	var user caddyauth.User
+
+	if p.UserID != "" {
+		if val, found := jsonPointerGet(doc, p.UserID); found {
+			user.ID = claimToString(val)
+		}
+	}
+
+	if len(p.Claims) > 0 {
+		user.Metadata = make(map[string]string, len(p.Claims))
+	}
+	for name, ptr := range p.Claims {
+		val, found := jsonPointerGet(doc, ptr)
+		if !found {
+			// a claim the service omitted is left unset, so that
+			// {vars.<name>} is empty rather than false
+			continue
+		}
+
+		// The value keeps the type it decoded as, so that a CEL
+		// expression like {vars.can_manage} == true compares against a
+		// real boolean. Stringifying here would force users to write
+		// == "true" instead.
+		caddyhttp.SetVar(r.Context(), name, val)
+
+		// User.Metadata is map[string]string and cannot hold the native
+		// value, so a rendered form is stored alongside it.
+		user.Metadata[name] = claimToString(val)
+	}
+
+	return user, true, nil
+}
+
+// claimToString renders a decoded JSON value for User.Metadata, which can
+// hold nothing but strings. Numbers are formatted without an exponent so
+// that identifiers stay legible, and objects and arrays are re-encoded as
+// JSON rather than rendered with Go's native formatting.
+func claimToString(v any) string {
+	switch val := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return val
+	case bool:
+		return strconv.FormatBool(val)
+	case float64:
+		return strconv.FormatFloat(val, 'f', -1, 64)
+	default:
+		b, err := json.Marshal(val)
+		if err != nil {
+			return ""
+		}
+		return string(b)
+	}
 }
 
 // Interface guards

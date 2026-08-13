@@ -15,6 +15,8 @@
 package authjson
 
 import (
+	"github.com/dustin/go-humanize"
+
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
@@ -37,7 +39,13 @@ func init() {
 // UnmarshalCaddyfile sets up the provider from Caddyfile tokens. Syntax:
 //
 //	auth_json [<matcher>] {
-//	    endpoint <url>
+//	    endpoint        <url>
+//	    method          <verb>
+//	    forward_headers <field...>
+//	    timeout         <duration>
+//	    claim           <name> <pointer>
+//	    user_id         <pointer>
+//	    max_size        <size>
 //	}
 func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	d.Next() // consume directive name
@@ -78,6 +86,41 @@ func (p *Provider) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				return d.Errf("bad duration value %s: %v", d.Val(), err)
 			}
 			p.Timeout = caddy.Duration(dur)
+
+		case "claim":
+			args := d.RemainingArgs()
+			if len(args) != 2 {
+				return d.ArgErr()
+			}
+			if p.Claims == nil {
+				p.Claims = make(map[string]string)
+			}
+			if existing, ok := p.Claims[args[0]]; ok {
+				return d.Errf("claim %s already declared: %s", args[0], existing)
+			}
+			p.Claims[args[0]] = args[1]
+
+		case "user_id":
+			if p.UserID != "" {
+				return d.Errf("user_id already declared: %s", p.UserID)
+			}
+			if !d.AllArgs(&p.UserID) {
+				return d.ArgErr()
+			}
+
+		case "max_size":
+			if p.MaxSize != 0 {
+				return d.Errf("max_size already declared")
+			}
+			var sizeStr string
+			if !d.AllArgs(&sizeStr) {
+				return d.ArgErr()
+			}
+			size, err := humanize.ParseBytes(sizeStr)
+			if err != nil {
+				return d.Errf("parsing max_size: %v", err)
+			}
+			p.MaxSize = int64(size)
 
 		default:
 			return d.Errf("unrecognized auth_json subdirective '%s'", d.Val())
