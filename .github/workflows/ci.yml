@@ -1,0 +1,112 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # the drift check only matters as time passes, so it runs on a timer
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # the lower bound is the version declared in go.mod: without it the
+        # minimum is only a claim, since development happens on the newer one
+        go: ["1.25.x", "~1.26"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: ${{ matrix.go }}
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "these files need gofmt:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: vet
+        run: go vet ./...
+
+      # the provider is shared across concurrent requests, so races are a
+      # plausible failure mode rather than a theoretical one
+      - name: test
+        run: go test -race -count=1 ./...
+
+  plugin:
+    name: loads into caddy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "~1.26"
+          check-latest: true
+
+      # Compiling is not enough: a module which fails to register, or whose
+      # Caddyfile directive is rejected, still builds cleanly. This is the
+      # only check which exercises the plugin the way a user installs it.
+      - name: build caddy with the plugin
+        run: |
+          go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+          xcaddy build --with github.com/faiyaz032/caddy-auth-json="$PWD" --output ./caddy
+
+      - name: module is registered
+        run: ./caddy list-modules | grep -qx 'http.authentication.providers.auth_json'
+
+      - name: caddyfile adapts
+        run: |
+          cat > Caddyfile <<'EOF'
+          {
+          	admin off
+          	auto_https off
+          }
+          :8080 {
+          	auth_json {
+          		endpoint http://127.0.0.1:9091/verify
+          		forward_headers Cookie
+          		claim can_manage /manage
+          		user_id /user/id
+          	}
+          	respond "ok"
+          }
+          EOF
+          ./caddy validate --config Caddyfile
+
+  caddy-master:
+    name: caddy master
+    # xcaddy resolves Caddy independently of go.mod, so users routinely build
+    # this plugin against a Caddy newer than the one pinned here. This job is
+    # how a breaking change upstream is noticed before a user reports it.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "~1.26"
+          check-latest: true
+
+      - name: build and test against caddy master
+        run: |
+          go get github.com/caddyserver/caddy/v2@master
+          go mod tidy
+          go build ./...
+          go test -count=1 ./...
